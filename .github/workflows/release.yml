@@ -80,12 +80,22 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "releasing $name $version"
 
-          # `curl -f` fails on 404, which is exactly "this version is not on PyPI".
-          if curl -fsS -o /dev/null "https://pypi.org/pypi/$name/$version/json"; then
-            pypi_missing=false
-          else
-            pypi_missing=true
-          fi
+          # THE STATUS CODE, NOT `curl -f`. `-f` fails on 404 AND on 503, a DNS blip,
+          # a proxy hiccup and a timeout, and every one of those would be read here as
+          # "this version is not on PyPI" -- so a transient error makes the run try to
+          # publish a version that already exists and fail on "File already exists",
+          # which is exactly the not-idempotent behaviour this file promises to avoid.
+          # Only 200 and 404 are answers. Anything else is "I do not know", and a
+          # publish is not something to guess about.
+          status=$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
+            --retry-all-errors --max-time 30 \
+            "https://pypi.org/pypi/$name/$version/json" || echo 000)
+          case "$status" in
+            200) pypi_missing=false ;;
+            404) pypi_missing=true  ;;
+            *)   echo "::error::PyPI answered $status for $name $version — neither published nor unpublished, and guessing either way publishes twice or skips a release"
+                 exit 1 ;;
+          esac
           if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
             tag_missing=false
           else

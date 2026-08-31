@@ -16,23 +16,27 @@ canfail canfail.json
 ```
 
 ```
-FINDINGS — 2:
+FINDINGS — 1:
   BLIND    unit tests / label: upper -> lower — the check still PASSED with src/prices.py
            broken — this guard cannot see this defect
-  WRONG    unit tests / a break that only breaks the syntax — the check failed on a SYNTAX
-           error, which every check does — this break made the file unparseable and tested nothing
 
-LOOK — 1, which never fail the run:
+LOOK — 2, which never fail the run:
   look     unit tests / an anchor that no longer exists — the anchor matches 0 times in
            src/prices.py and must match exactly once — nothing would have been broken
+  look     unit tests / a break that only breaks the syntax — the check produced no evidence
+           it ran against the break (nothing in output matched Ran (\d+) tests, so no count
+           was reported at all), so this settles nothing about whether it would have noticed
 
 CAUGHT — 1:
   catches  unit tests / total: multiply -> add — broke src/prices.py, the check went red
 
-4 declared break(s): 1 caught, 2 not caught, 1 not settled
+4 declared break(s): 1 caught, 1 not caught, 2 not settled
 ```
 
-That run is `example/`, and it is four outcomes from four declared breaks.
+That run is `example/`, and it is four outcomes from four declared breaks. The syntax
+break is a `look` rather than a `wrong-failure` because that config declares `evidence`;
+see below for what that buys. `ci.yml` asserts this tally line rather than just the exit
+code, because exit 1 alone would be satisfied by finding the wrong thing.
 
 ## Configuration
 
@@ -55,7 +59,11 @@ That run is `example/`, and it is four outcomes from four declared breaks.
 ```
 
 `run` is a command (a list, or a string for a shell). `expect` is optional and is the
-third question below.
+third question below. `timeout` is per check and defaults to 900s; a check that hits it
+is `look`, never `catches` — see rule 2.
+
+Paths in `file`, and in `evidence: { "wrote": ... }`, are relative to `--cwd` when you
+pass one, which is the directory the checks themselves run in.
 
 ## Four ways to get this wrong, all borrowed
 
@@ -69,7 +77,9 @@ such a check is a `look`, with the failing line quoted.
 **2. A failure is not a catch.** The check has to fail *for the reason you named*. A break
 that makes the file unparseable makes every check fail, and that reads as "caught" when
 nothing was caught — so a failure whose output looks like a syntax error is scored
-`wrong-failure`, as is one that does not match your `expect`.
+`wrong-failure`, as is one that does not match your `expect`. **Nor is a kill.** A check
+that hit its `timeout` exits 124, which reads exactly like a check that went red; it did
+not go red, it did not finish, and it is scored `look`.
 
 **3. The anchor must match exactly once.** Zero means the break never happened and the
 check passed for the most boring possible reason. Two means the first occurrence was
@@ -79,7 +89,7 @@ thinking of. Both are `look`, and the message says which.
 **4. The file must come back, and the restore must be checked.** This deliberately breaks
 source on disk. `finally` does not run on SIGTERM — a test spawns a real child, kills it,
 and asserts the source is back — and a restore that *ran* is not a restore that *worked*,
-so the digest is compared afterwards. That is [`restore-verified`](../../restore-verified),
+so the digest is compared afterwards. That is [`restore-verified`](https://pypi.org/project/restore-verified/),
 which this package **depends on** rather than copies. It used to be 78 lines of `_Guard`
 inline — a quarter of the module — carried so `canfail` had no dependencies at all. That
 was right while `restore-verified` was unpublished and wrong afterwards: those properties
@@ -110,13 +120,18 @@ look  a break that only breaks the syntax — the check produced no evidence it 
       reported at all), so this settles nothing about whether it would have noticed
 ```
 
-That is also the strong form of rule 2 below. Grepping the output for the word "syntax"
+That is also the strong form of rule 2 above. Grepping the output for the word "syntax"
 *guesses* at what happened; an evidence predicate **measures** it — a check that never
 reached its own tally did not run, whatever it printed on the way out, and in a language
 whose parse error uses words the regex has never heard of.
 
 `evidence` is optional and every existing config keeps working. Omit it and `blind` says
 outright that it cannot tell the two apart, rather than quietly picking one.
+
+What it will not do is *silently* fall back. An `evidence` object naming none of `count`,
+`expect` or `wrote` is a config error rather than a no-op: a misspelled key would leave
+the check running in the weak form while the config says otherwise, which is this
+package's own failure mode pointed at itself.
 
 ## The verdicts
 
@@ -125,7 +140,7 @@ outright that it cannot tell the two apart, rather than quietly picking one.
 | `catches` | broke it, the check went red as declared | no |
 | `blind` | the check **ran** and still passed with the thing broken | **yes** |
 | `wrong-failure` | it failed, but on syntax or not on `expect` | **yes** |
-| `look` | baseline red, anchor not exactly once, check would not run | no |
+| `look` | baseline red, anchor not exactly once, check would not run, check was killed on `timeout` | no |
 
 Exit 0 when every declared break was caught, 1 on any finding, 2 when the tool could not
 run. The denominator is always printed: a config with no breaks and a config whose every
@@ -176,7 +191,9 @@ answer.
   YAML, JSON, Terraform or Dockerfiles, where there is no parser to match against. The
   exactly-once rule is what makes a string anchor safe enough to use.
 - One break at a time, restored between each. No parallelism.
-- Zero dependencies, Python 3.9+.
+- Two dependencies, both layer-0 roots with none of their own
+  ([`restore-verified`](https://pypi.org/project/restore-verified/) and
+  [`didrun`](https://pypi.org/project/didrun/)). Python 3.9+.
 
 ## Tests
 
@@ -184,8 +201,37 @@ answer.
 python3 -m unittest discover -s tests
 ```
 
-15 tests, including a real SIGTERM to a real child. Five mutations were applied — skipping
-the clean-tree baseline, accepting any anchor count, scoring a syntax failure as a catch,
-not verifying the restore, and re-enabling bytecode caching — and each was caught by the
-test that should catch it. A sixth (restoring mtime) **survived**, which is how the
-paragraph above got corrected.
+28 tests. Five mutations were applied to the original five properties — skipping the
+clean-tree baseline, accepting any anchor count, scoring a syntax failure as a catch, not
+verifying the restore, and re-enabling bytecode caching — and each was caught by the test
+that should catch it. A sixth (restoring mtime) **survived**, which is how the paragraph
+above got corrected. Six more were applied to the fixes below and all six were caught.
+
+The SIGTERM test — a real child, really killed, the source checked by digest afterwards —
+now lives in [`restore-verified`](https://pypi.org/project/restore-verified/), which owns
+that property. What stays here is the integration assertion: canfail's own use of the
+guard leaves the tree as it found it.
+
+## Things this got wrong about itself
+
+Each of these was a way `canfail` reported a verdict it had not earned, which is the
+defect it exists to find in other people's CI. Each is now pinned by a test that fails
+without the fix.
+
+- **A killed check was scored `catches`.** `didrun` does not raise on a timeout — it
+  kills the child and reports exit 124 — and 124 is non-zero, so a check that *hung* on
+  the broken source read as a check that *noticed* it. Worse, the two paths disagreed:
+  without `evidence` the same hang was a `look`. One timeout is one verdict, and it is
+  `look`.
+- **`evidence: { "wrote": ... }` was resolved in the wrong directory.** The predicate
+  stats the path in canfail's own process while the check runs in `--cwd`, so a check
+  that wrote its report perfectly well reported as never having run.
+- **A misspelled `evidence` key silently disabled it.** The check fell back to the weak
+  form and the outcome then said "no `evidence` declared" to someone looking straight at
+  the declaration. A declaration that does nothing is now a config error.
+- **A bad regex exited 1.** An uncompilable `expect` reached the interpreter as a
+  traceback, and exit 1 is the code that means *a guard is BLIND*. Patterns are compiled
+  when the config is loaded, before anything is broken, and a config error is exit 2.
+- **A break on a CRLF file rewrote every line ending.** Universal-newline mode stripped
+  the `\r`s on read and the guard wrote the text back verbatim, so a one-line break
+  arrived as a whole-file diff.

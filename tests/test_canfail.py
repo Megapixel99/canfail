@@ -1,7 +1,9 @@
 """Each verdict, and the controls that make it falsifiable."""
 
+import contextlib
 import hashlib
 import inspect
+import io
 import os
 import shutil
 import subprocess
@@ -14,8 +16,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from canfail import run_check  # noqa: E402
+from canfail import load_config, run_check  # noqa: E402
 import canfail.core  # noqa: E402
+from canfail.cli import main  # noqa: E402
 from restore_verified import RestoreFailed  # noqa: E402
 
 SOURCE = textwrap.dedent(
@@ -300,6 +303,205 @@ class TheOrderingBug(Fixture):
         alone = self.check([self.a_break("label", "return name.upper()",
                                          "return name.lower()")])
         self.assertEqual(alone.outcomes[0].verdict, "blind")
+
+
+class AKillIsNotACatch(Fixture):
+    """A check that ran out of time did not go red — it did not finish.
+
+    `didrun` does not RAISE on a timeout: it kills the child and hands back exit 124,
+    which every branch that reads a non-zero status as "the check noticed" scores as a
+    catch. That is the tool reporting a working guard where there is a hang, which is
+    the precise failure it exists to find in other people's CI.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Prints its evidence, THEN hangs on the broken source. The evidence is printed
+        # first on purpose: with no output at all a timeout is indistinguishable from a
+        # check that never ran, and it is the case where the predicate IS satisfied that
+        # used to come back as `catches`.
+        self.hangs = os.path.join(self.dir, "hangs.py")
+        with open(self.hangs, "w") as fh:
+            fh.write(textwrap.dedent(f"""\
+                import sys, time
+                src = open({self.mod!r}).read()
+                print("checked 1 files", flush=True)
+                if "upper" not in src:
+                    time.sleep(60)
+                sys.exit(0)
+                """))
+
+    def a_hanging_check(self, evidence=None):
+        check = {
+            "name": "hangs on the break",
+            "run": [sys.executable, self.hangs],
+            "timeout": 2,
+            "breaks": [self.a_break("label", "return name.upper()",
+                                    "return name.lower()")],
+        }
+        if evidence:
+            check["evidence"] = evidence
+        return run_check(check)
+
+    def test_a_check_killed_on_timeout_is_a_look_not_a_catch(self):
+        out = self.a_hanging_check({"count": r"checked (\d+) files"})
+        self.assertEqual([o.verdict for o in out.outcomes], ["look"])
+        self.assertIn("killed after 2s", out.outcomes[0].detail)
+
+    def test_the_same_hang_without_evidence_is_also_a_look(self):
+        # THE CONTROL FOR THE CONTROL. The two paths through `_run` used to disagree
+        # about the same event: `look` without evidence, `catches` with it. One timeout
+        # is one verdict.
+        out = self.a_hanging_check()
+        self.assertEqual([o.verdict for o in out.outcomes], ["look"])
+        self.assertIn("killed after 2s", out.outcomes[0].detail)
+
+    def test_a_check_that_times_out_on_the_CLEAN_tree_has_no_baseline(self):
+        with open(self.mod, "w") as fh:
+            fh.write("def label(name):\n    return name.lower()\n")
+        out = run_check({
+            "name": "hangs on everything",
+            "run": [sys.executable, self.hangs],
+            "timeout": 2,
+            "evidence": {"count": r"checked (\d+) files"},
+            "breaks": [self.a_break("label", "return name.lower()",
+                                    "return name.title()")],
+        })
+        self.assertEqual([o.verdict for o in out.outcomes], ["look"])
+        self.assertIn("did not finish on the clean tree", out.outcomes[0].detail)
+
+
+class EvidenceIsResolvedWhereTheCheckRuns(unittest.TestCase):
+    """`wrote` names a file the CHECK writes, so it is the check's cwd that it is in.
+
+    The predicate stats the path in this process. Resolving it against the config's
+    directory instead makes a check that ran perfectly report as never having run, and
+    every break under it becomes an unsettled `look`.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="canfail-cwd-")
+        os.makedirs(os.path.join(self.dir, "src"))
+        with open(os.path.join(self.dir, "src", "mod.py"), "w") as fh:
+            fh.write("SPEED = 'fast'\n")
+        with open(os.path.join(self.dir, "chk.py"), "w") as fh:
+            fh.write(textwrap.dedent("""\
+                import sys
+                src = open("src/mod.py").read()
+                open("report.json", "w").write("{}")
+                sys.exit(0 if "fast" in src else 1)
+                """))
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_wrote_predicate_is_relative_to_the_check_s_cwd(self):
+        out = run_check({
+            "name": "writes a report",
+            "run": [sys.executable, "chk.py"],
+            "evidence": {"wrote": "report.json"},
+            "breaks": [{"name": "fast -> slow", "file": "src/mod.py",
+                        "replace": "'fast'", "with": "'slow'"}],
+        }, cwd=self.dir)
+        self.assertEqual([o.verdict for o in out.outcomes], ["catches"])
+
+
+class AConfigThatCannotRunIsExit2(unittest.TestCase):
+    """A config mistake and a finding must not share an exit status.
+
+    `re.error` is not a `ValueError`, so an uncompilable pattern used to escape every
+    `except` here and reach the interpreter — a traceback and exit 1, which is the code
+    that means a guard is BLIND. CI branching on the documented exit codes reads that as
+    a finding.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="canfail-cfg-")
+        self.path = os.path.join(self.dir, "canfail.json")
+        with open(os.path.join(self.dir, "mod.py"), "w") as fh:
+            fh.write("SPEED = 'fast'\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write(self, config):
+        import json
+        with open(self.path, "w") as fh:
+            json.dump(config, fh)
+        return self.path
+
+    def a_config(self, **break_extra):
+        return {"checks": [{
+            "name": "c", "run": [sys.executable, "-c", "pass"],
+            "breaks": [dict({"name": "b", "file": os.path.join(self.dir, "mod.py"),
+                             "replace": "'fast'", "with": "'slow'"}, **break_extra)],
+        }]}
+
+    def test_an_uncompilable_expect_is_rejected_before_anything_is_broken(self):
+        with self.assertRaises(ValueError) as caught:
+            load_config(self.write(self.a_config(expect="(")))
+        self.assertIn("not a valid regular expression", str(caught.exception))
+
+    def test_the_cli_exits_2_on_a_bad_pattern_rather_than_1(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = main([self.write(self.a_config(expect="("))])
+        self.assertEqual(code, 2, "exit 1 would be indistinguishable from a finding")
+        self.assertIn("canfail:", err.getvalue())
+
+    def test_an_evidence_object_that_declares_nothing_is_rejected(self):
+        # A misspelled key would otherwise leave the check running in the weak form
+        # while the config says otherwise — and the outcome would report "no `evidence`
+        # declared" to someone looking straight at the declaration.
+        config = self.a_config()
+        config["checks"][0]["evidence"] = {"expct": r"Ran (\d+) tests"}
+        with self.assertRaises(ValueError) as caught:
+            load_config(self.write(config))
+        self.assertIn("expct", str(caught.exception))
+
+    def test_omitting_evidence_entirely_is_still_fine(self):
+        # The control: the rejection above must be about a typo, not about the absence.
+        self.assertEqual(load_config(self.write(self.a_config()))["checks"][0]["name"],
+                         "c")
+
+
+class TheBreakIsTheOnlyEdit(unittest.TestCase):
+    """A CRLF file must come out of a break with its line endings intact.
+
+    Universal-newline mode hands back the text with every `\r` stripped, and the guard
+    writes that text back verbatim — so a one-line break rewrites every line ending in
+    the file, and a formatting guard goes red for a change nobody declared.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="canfail-crlf-")
+        self.mod = os.path.join(self.dir, "mod.py")
+        with open(self.mod, "wb") as fh:
+            fh.write(b"SPEED = 'fast'\r\nOTHER = 1\r\n")
+        self.seen = os.path.join(self.dir, "seen.bin")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_only_the_anchor_changes(self):
+        chk = os.path.join(self.dir, "chk.py")
+        with open(chk, "w") as fh:
+            fh.write(textwrap.dedent(f"""\
+                import sys
+                data = open({self.mod!r}, "rb").read()
+                open({self.seen!r}, "wb").write(data)
+                sys.exit(0 if b"fast" in data else 1)
+                """))
+        run_check({
+            "name": "reads the bytes",
+            "run": [sys.executable, chk],
+            "breaks": [{"name": "fast -> slow", "file": self.mod,
+                        "replace": "'fast'", "with": "'slow'"}],
+        })
+        with open(self.seen, "rb") as fh:
+            broken = fh.read()
+        self.assertEqual(broken, b"SPEED = 'slow'\r\nOTHER = 1\r\n",
+                         "the break rewrote the line endings as well as the anchor")
 
 
 if __name__ == "__main__":

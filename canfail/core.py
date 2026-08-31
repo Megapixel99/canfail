@@ -24,6 +24,12 @@ one, for CI configuration rather than for code:
      file. Declare `evidence` on a check and the two are separated. Omit it and they are
      not, and the message says so rather than picking one.
 
+  2c. AND A KILL IS NEITHER. A check that ran out of time did not go red; it did not
+     finish. `didrun` catches the timeout and hands back exit 124 rather than raising,
+     so `killed` -- not the exit status -- is the only thing that can say which happened.
+     See `_Ran` below: reading 124 as "the check went red as declared" is how a hang
+     gets scored as a catch.
+
   3. THE ANCHOR MUST MATCH EXACTLY ONCE. An anchor matching zero places is a break that
      never happened, and the check passes for the most boring possible reason. One
      matching twice edits the first occurrence, which may not be the one you meant, so
@@ -58,6 +64,10 @@ from didrun import evidence as ev
 from restore_verified import RestoreFailed, guarded
 
 DEFAULT_TIMEOUT = 900
+
+# The conventional status for a killed-on-timeout command, as `timeout(1)` uses and as
+# `didrun` reports. It is never read as a verdict here -- see `_Ran.killed`.
+TIMEOUT_CODE = 124
 
 # A break that makes the source unparseable makes EVERY check fail, so a failure that
 # looks like this is not evidence the guard works.
@@ -121,28 +131,83 @@ class Report:
 # Running checks.
 # --------------------------------------------------------------------------- #
 
-def _predicates(spec):
+def _regex(pattern, where: str):
+    """Compile a caller-supplied pattern, or say WHICH field was not a regex.
+
+    `re.error` is not a `ValueError`, so an uncompilable pattern from a config file
+    escapes every `except` in this package and reaches the interpreter as a traceback --
+    exit 1, which is the code that means "a guard is BLIND". A config mistake and a
+    finding must not share an exit status, so it is re-raised as the config error it is.
+    """
+    try:
+        return re.compile(pattern)
+    except (re.error, TypeError) as exc:
+        raise ValueError(f"{where} is not a valid regular expression: {exc}") from None
+
+
+@dataclass
+class _Ran:
+    """One finished run of a check.
+
+    `killed` is separate from `code` ON PURPOSE. `didrun` does not raise on a timeout --
+    it kills the child and reports exit 124 -- and every branch that reads a non-zero
+    status as "the check noticed" would score a hang as a catch. A killed check did not
+    go red; it did not finish, and that settles nothing either way.
+    """
+
+    code: int
+    output: str
+    state: object = None
+    why: str = ""
+    killed: bool = False
+
+
+def _predicates(spec, cwd=None):
     """`didrun` predicates from a check's `evidence`, or [] when none was declared.
 
     A string is the common case and means "the output must match this". The object form
     exists for the one that matters: a COUNT, because what makes a green run meaningless
     is almost always a zero rather than an absence.
+
+    `wrote` is resolved against `cwd`, the directory the check itself runs in. The
+    predicate stats the path in THIS process, so a bare `report.json` would otherwise be
+    looked for beside the config while the check writes it beside itself, and the miss
+    reads as "the check never ran" for a check that ran perfectly.
     """
     if not spec:
         return []
     if isinstance(spec, str):
-        return [ev.matches(spec)]
+        return [ev.matches(_regex(spec, "`evidence`"))]
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"`evidence` must be a string or an object, not {type(spec).__name__}")
     out = []
     if "count" in spec:
-        out.append(ev.count(spec["count"], minimum=int(spec.get("min", 1))))
+        out.append(ev.count(_regex(spec["count"], "`evidence.count`"),
+                            minimum=int(spec.get("min", 1))))
     if "expect" in spec:
-        out.append(ev.matches(spec["expect"]))
+        out.append(ev.matches(_regex(spec["expect"], "`evidence.expect`")))
     if "wrote" in spec:
-        out.append(ev.wrote(spec["wrote"]))
+        out.append(ev.wrote(os.path.join(cwd, spec["wrote"]) if cwd else spec["wrote"]))
+    if not out:
+        # SILENTLY FALLING BACK IS THE FAILURE THIS PACKAGE IS ABOUT. A misspelled key
+        # would leave a check running in the weak form while its config says otherwise,
+        # and the outcome would then report "no `evidence` declared" to someone looking
+        # straight at the declaration.
+        raise ValueError(
+            f"`evidence` declares none of `count`, `expect` or `wrote` — it has "
+            f"{sorted(spec)!r}. Omitting `evidence` is fine; declaring one that does "
+            f"nothing is a typo that would quietly disable the check it was added for")
     return out
 
 
-def _run(command, cwd=None, timeout=DEFAULT_TIMEOUT, predicates=()):
+def _text(chunk) -> str:
+    if chunk is None:
+        return ""
+    return chunk if isinstance(chunk, str) else chunk.decode(errors="replace")
+
+
+def _run(command, cwd=None, timeout=DEFAULT_TIMEOUT, predicates=()) -> _Ran:
     # `PYTHONDONTWRITEBYTECODE` SO A CHECK DOES NOT LEAVE A CACHE THE NEXT BREAK
     # INHERITS. This is the load-bearing guard, established by mutation rather than by
     # argument: removing it makes a genuinely BLIND guard report as catching, because
@@ -157,15 +222,25 @@ def _run(command, cwd=None, timeout=DEFAULT_TIMEOUT, predicates=()):
         # The unsatisfied predicates, so a `look` can say WHAT was looked for and what
         # was there instead of just "no evidence".
         why = "; ".join(c.detail for c in result.checks if not c.satisfied)
-        return result.code, result.stdout + result.stderr, result.state, why
-    if isinstance(command, str):
-        proc = subprocess.run(command, shell=True, cwd=cwd, capture_output=True,
-                              text=True, timeout=timeout, env=env)
-    else:
-        proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
-                              timeout=timeout, env=env)
+        # `result.killed`, NOT `result.code`. `didrun` catches the timeout itself and
+        # reports exit 124, which reads exactly like a check that went red.
+        return _Ran(result.code, result.stdout + result.stderr, result.state, why,
+                    result.killed)
+    try:
+        if isinstance(command, str):
+            proc = subprocess.run(command, shell=True, cwd=cwd, capture_output=True,
+                                  text=True, timeout=timeout, env=env)
+        else:
+            proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
+                                  timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as expired:
+        # The same shape the evidence path returns, so a timeout means ONE thing here
+        # whether or not `evidence` was declared. It used to mean two: a `look` without
+        # evidence and a `catches` with it, for the same hang.
+        return _Ran(TIMEOUT_CODE, _text(expired.stdout) + _text(expired.stderr),
+                    killed=True)
     # No evidence declared, so nothing here can speak to whether it ran.
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or ""), None, ""
+    return _Ran(proc.returncode, (proc.stdout or "") + (proc.stderr or ""))
 
 
 def run_check(check: dict, cwd=None) -> Report:
@@ -181,36 +256,39 @@ def run_check(check: dict, cwd=None) -> Report:
             "no breaks declared — a check with nothing to catch is not being tested"))
         return report
 
-    predicates = _predicates(check.get("evidence"))
+    if "run" not in check:
+        raise ValueError(f"the check {name!r} has no `run`")
+    predicates = _predicates(check.get("evidence"), cwd)
+
+    def every_break(detail):
+        for br in breaks:
+            report.outcomes.append(Outcome(name, br.get("name", "?"), "look", detail))
+        return report
 
     # (1) THE BASELINE. Without it a red check looks like a working one.
     try:
-        code, output, state, why = _run(check["run"], cwd, timeout, predicates)
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        for br in breaks:
-            report.outcomes.append(Outcome(
-                name, br.get("name", "?"), "look",
-                f"the check could not be run on the clean tree ({exc})"))
-        return report
-    if state == didrun.DID_NOT_RUN:
+        ran = _run(check["run"], cwd, timeout, predicates)
+    except OSError as exc:
+        return every_break(f"the check could not be run on the clean tree ({exc})")
+    if ran.killed:
+        # BEFORE EVERYTHING ELSE. A check that does not finish on a CLEAN tree has no
+        # baseline at all, and its exit status is the timeout's rather than its own.
+        return every_break(
+            f"the check did not finish on the clean tree — it was killed after "
+            f"{timeout}s, so there is no baseline to compare a break against")
+    if ran.state == didrun.DID_NOT_RUN:
         # BEFORE "it already fails", because this is the stronger objection. A check
         # that produces no evidence of running on a CLEAN tree will produce none on a
         # broken one either, and every verdict after this point would be an artefact of
         # a command that did nothing.
-        for br in breaks:
-            report.outcomes.append(Outcome(
-                name, br.get("name", "?"), "look",
-                f"the check produced no evidence it ran, even on a clean tree — "
-                f"{why} — so breaking something can prove nothing from here"))
-        return report
-    if code != 0:
-        tail = (output.strip().splitlines() or ["silent"])[-1][:110]
-        for br in breaks:
-            report.outcomes.append(Outcome(
-                name, br.get("name", "?"), "look",
-                f"the check already FAILS on the clean tree (exit {code}: {tail}) — "
-                f"breaking something can prove nothing from here"))
-        return report
+        return every_break(
+            f"the check produced no evidence it ran, even on a clean tree — "
+            f"{ran.why} — so breaking something can prove nothing from here")
+    if ran.code != 0:
+        tail = (ran.output.strip().splitlines() or ["silent"])[-1][:110]
+        return every_break(
+            f"the check already FAILS on the clean tree (exit {ran.code}: {tail}) — "
+            f"breaking something can prove nothing from here")
 
     for br in breaks:
         report.outcomes.append(_one_break(name, br, check, cwd, timeout, predicates))
@@ -224,7 +302,11 @@ def _one_break(check_name: str, br: dict, check: dict, cwd, timeout,
     if not os.path.exists(path):
         return Outcome(check_name, br_name, "look", f"{br['file']} does not exist")
 
-    with open(path, encoding="utf-8") as fh:
+    # `newline=""` SO THE BREAK IS THE ONLY EDIT. Universal-newline mode would hand back
+    # a CRLF file with every `\r` stripped, and the guard writes the text back verbatim
+    # -- so on a CRLF checkout the "one-line" break rewrites every line ending in the
+    # file, and a formatting guard goes red for a change nobody declared.
+    with open(path, encoding="utf-8", newline="") as fh:
         original = fh.read()
 
     # (3) EXACTLY ONCE. Zero is a break that never happened; two is a break somewhere
@@ -248,23 +330,32 @@ def _one_break(check_name: str, br: dict, check: dict, cwd, timeout,
         with guarded(path, restore_mtime=False) as guard:
             guard.write(original.replace(anchor, br["with"], 1))
             try:
-                code, output, state, why = _run(check["run"], cwd, timeout, predicates)
-            except (subprocess.TimeoutExpired, OSError) as exc:
+                ran = _run(check["run"], cwd, timeout, predicates)
+            except OSError as exc:
                 return Outcome(check_name, br_name, "look",
                                f"the check could not be run against the break ({exc})")
     except RestoreFailed as exc:
         return Outcome(check_name, br_name, "look", str(exc))
 
-    if state == didrun.DID_NOT_RUN:
+    if ran.killed:
+        # NOT `catches`. Exit 124 is the timeout's status and not the check's, and a
+        # check that was killed never reached a verdict about anything.
+        return Outcome(
+            check_name, br_name, "look",
+            f"the check did not finish against the break — it was killed after "
+            f"{timeout}s, so its exit status is the timeout's rather than a verdict "
+            f"about the break")
+
+    if ran.state == didrun.DID_NOT_RUN:
         # NOT `blind`. The check did not run against the break, so it had no opportunity
         # to notice -- reporting that as "this guard cannot see this defect" would blame
         # a guard for a run that never happened.
         return Outcome(
             check_name, br_name, "look",
-            f"the check produced no evidence it ran against the break ({why}), so this "
-            f"settles nothing about whether it would have noticed")
+            f"the check produced no evidence it ran against the break ({ran.why}), so "
+            f"this settles nothing about whether it would have noticed")
 
-    if code == 0:
+    if ran.code == 0:
         # (THE FINDING.) The guard ran and did not notice. That is what this exists to
         # report — and with `evidence` declared it is now the narrow claim rather than
         # the broad one.
@@ -277,14 +368,15 @@ def _one_break(check_name: str, br: dict, check: dict, cwd, timeout,
             f"this defect{unsure}")
 
     # (2) A FAILURE IS NOT A CATCH.
-    if SYNTAX_NOISE.search(output):
+    if SYNTAX_NOISE.search(ran.output):
         return Outcome(
             check_name, br_name, "wrong-failure",
             "the check failed on a SYNTAX error, which every check does — this break "
             "made the file unparseable and tested nothing")
     expect = br.get("expect")
-    if expect and not re.search(expect, output):
-        tail = (output.strip().splitlines() or ["silent"])[-1][:110]
+    if expect and not _regex(expect, f"`expect` on the break {br_name!r}").search(
+            ran.output):
+        tail = (ran.output.strip().splitlines() or ["silent"])[-1][:110]
         return Outcome(
             check_name, br_name, "wrong-failure",
             f"it failed, but not with {expect!r} — it said: {tail}")
@@ -299,16 +391,26 @@ def run_config(config: dict, cwd=None) -> Report:
     return report
 
 
-def load_config(path: str) -> dict:
+def load_config(path: str, cwd=None) -> dict:
+    """Read a config, and reject one that cannot be run BEFORE anything is broken.
+
+    Every pattern is compiled here rather than at the point of use. A regex that does
+    not compile is a config error, and finding it three breaks in -- after files have
+    been edited and restored -- turns a typo into a traceback in the middle of a run.
+    """
     with open(path, encoding="utf-8") as fh:
         config = json.load(fh)
-    if not isinstance(config, dict) or "checks" not in config:
+    if not isinstance(config, dict) or not isinstance(config.get("checks"), list):
         raise ValueError(f"{path} has no `checks` list")
     for check in config["checks"]:
-        if "run" not in check:
+        if not isinstance(check, dict) or "run" not in check:
             raise ValueError("every check needs a `run`")
+        _predicates(check.get("evidence"), cwd)
         for br in check.get("breaks", []):
             for key in ("file", "replace", "with"):
                 if key not in br:
                     raise ValueError(f"every break needs `{key}`")
+            if br.get("expect"):
+                where = br.get("name", br["file"])
+                _regex(br["expect"], f"`expect` on the break {where!r}")
     return config

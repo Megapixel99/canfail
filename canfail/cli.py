@@ -28,13 +28,22 @@ def main(argv=None) -> int:
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args(argv)
 
+    # EXIT 2 IS FOR "the tool could not run", and a config that cannot be run belongs
+    # in it. Both calls are guarded: `load_config` rejects what it can see up front, and
+    # `run_config` raises the same `ValueError` for anything only a direct API caller can
+    # reach. Letting either escape would exit 1 on a traceback, which is the code that
+    # means a guard is BLIND.
     try:
-        config = load_config(args.config)
+        config = load_config(args.config, cwd=args.cwd)
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"canfail: {exc}\n")
         return 2
 
-    report = run_config(config, cwd=args.cwd)
+    try:
+        report = run_config(config, cwd=args.cwd)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"canfail: {exc}\n")
+        return 2
 
     if args.as_json:
         json.dump(report.to_dict(), sys.stdout, indent=2, sort_keys=True)
