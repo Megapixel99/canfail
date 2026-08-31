@@ -1,5 +1,9 @@
 # `canfail`
 
+[![PyPI](https://img.shields.io/pypi/v/canfail?label=PyPI&color=3775A9)](https://pypi.org/project/canfail/)
+[![ci](https://github.com/Megapixel99/canfail/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Megapixel99/canfail/actions/workflows/ci.yml)
+[![license MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Break the thing on purpose, and check that your check notices.
 
 **A CI guard that has never failed may be incapable of failing.** A lint rule disabled by
