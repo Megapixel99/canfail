@@ -1,0 +1,43 @@
+{
+  "checks": [
+    {
+      "name": "unit tests",
+      "run": [
+        "python3",
+        "example/test_prices.py",
+        "-q"
+      ],
+      "breaks": [
+        {
+          "name": "total: multiply -> add",
+          "file": "example/src/prices.py",
+          "replace": "item[\"price\"] * item[\"quantity\"]",
+          "with": "item[\"price\"] + item[\"quantity\"]",
+          "expect": "assert|Error"
+        },
+        {
+          "name": "label: upper -> lower",
+          "file": "example/src/prices.py",
+          "replace": "return name.upper()",
+          "with": "return name.lower()",
+          "expect": "assert|Error"
+        },
+        {
+          "name": "an anchor that no longer exists",
+          "file": "example/src/prices.py",
+          "replace": "return name.title()",
+          "with": "return name.lower()"
+        },
+        {
+          "name": "a break that only breaks the syntax",
+          "file": "example/src/prices.py",
+          "replace": "def label(name):",
+          "with": "def label(name)"
+        }
+      ],
+      "evidence": {
+        "count": "Ran (\\d+) tests"
+      }
+    }
+  ]
+}

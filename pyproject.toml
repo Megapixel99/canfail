@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canfail"
+version = "0.1.0"
+description = "Break the thing on purpose and check that your check notices. A guard that never fails may be incapable of failing."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["ci", "guard", "mutation-testing", "lint", "verification", "false-positive",
+            "test-quality", "zero-dependency"]
+# LAYER 1. Both edges point at layer-0 roots -- packages with no in-network
+# dependencies of their own. `restore-verified` guards the file this breaks on purpose;
+# `didrun` answers whether the check ran at all, which is what separates a guard that is
+# blind from a guard that is absent. Dependencies point strictly downward, and
+# `tools/depgraph.py` in the reckoner tree asserts it.
+dependencies = ["restore-verified>=0.1.1", "didrun>=0.1.0"]
+
+[project.scripts]
+canfail = "canfail.cli:main"
+
+[tool.setuptools]
+packages = ["canfail"]

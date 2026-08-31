@@ -1,0 +1,182 @@
+# A tool that finds guards which cannot fail has to answer for its own.
+#
+# Three gates here are this package's own properties pointed back at the package:
+#
+#   1. IT RUNS ON ITS OWN EXAMPLE, and the verdicts are asserted exactly. `canfail`'s
+#      whole claim is that it can tell a guard that catches from one that is blind from
+#      one that never ran, and its `example/` contains one of each on purpose. A run
+#      that reported them any other way would be the joke telling itself.
+#
+#   2. THE TREE MUST BE CLEAN AFTERWARDS. This package breaks source on disk on purpose.
+#      If a restore is ever skipped the tally still prints and the damage shows up in the
+#      NEXT commit -- which is the failure `restore-verified` exists to catch, so it
+#      would be absurd not to check it here.
+#
+#   3. IT DECLARES DEPENDENCIES, AND THEY ARE THE DECLARED ONES. Unlike the roots this
+#      builds on, `canfail` is not dependency-free -- it is layer 1. The check is not
+#      "none" but "these, and nothing that arrived by accident".
+#
+# Action versions are pinned at v7 deliberately. Older majors still run, on a Node the
+# runner silently substitutes, and a pin that is wrong for its own runtime is invisible
+# in a pass/fail -- you only see it in an annotation nobody reads.
+name: ci
+
+on:
+  push:
+    # `master` only. A branch with an open PR matches both triggers and every job runs
+    # twice, and a concurrency group does NOT fix it: the push event keys on
+    # `refs/heads/<branch>` while the pull_request event keys on `<branch>`.
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  # `release.yml` calls this rather than copying the jobs into itself.
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor is what `pyproject.toml` claims, and the claim is checked rather
+        # than trusted: `requires-python = ">=3.9"` is a promise, and a promise nothing
+        # runs is the stale-documentation defect in a metadata file.
+        python-version: ['3.9', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: install the declared dependencies, and only those
+        # LAYER 1, so "no dependencies" is the wrong assertion. `restore-verified` guards
+        # the file this breaks on purpose and `didrun` answers whether a check ran at
+        # all; anything else arriving here is a dependency nobody declared.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet .
+          python3 -m pip list --format=freeze | sort > /tmp/installed.txt
+          cat /tmp/installed.txt
+          python3 - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as fh:
+              declared = tomllib.load(fh)["project"]["dependencies"]
+          print("declared:", declared)
+          names = {d.split(">")[0].split("=")[0].split("<")[0].strip() for d in declared}
+          assert names == {"restore-verified", "didrun"}, names
+          PY
+
+      - name: the suites
+        run: python3 -m unittest discover -s tests -v
+
+      - name: the tree came back
+        # This package breaks files on purpose. A dirty tree here means a restore was
+        # skipped, which is exactly what `restore-verified` is for.
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the suite left the tree dirty — a restore was skipped"
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+          echo "clean"
+
+  versions:
+    # The version lives in `pyproject.toml` and in `__version__`, and the second is what
+    # a user who imports the package reads back. Two places is two places to drift.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: both agree
+        run: |
+          set -euo pipefail
+          py=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          dunder=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 -c "import canfail; print(canfail.__version__)")
+          echo "pyproject=$py  __version__=$dunder"
+          if [ "$py" != "$dunder" ]; then
+            echo "::error::the two versions disagree"
+            exit 1
+          fi
+
+  itself:
+    # The tool pointed at the tool, with the verdicts asserted exactly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: install
+        run: python3 -m pip install --quiet .
+
+      - name: it finds the blind guard in its own example
+        # `example/` holds four declared breaks and one of each outcome on purpose: one
+        # the suite catches, one it is BLIND to (a hollow test that asserts nothing), one
+        # whose anchor no longer matches, and one that stops the check running at all.
+        # Asserting the summary line rather than just the exit code, because exit 1 alone
+        # would be satisfied by finding the wrong thing.
+        run: |
+          set +e
+          out=$(python3 -m canfail.cli example/canfail.json 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          echo "exit=$code"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 (findings), got $code"
+            exit 1
+          fi
+          expected="4 declared break(s): 1 caught, 1 not caught, 2 not settled"
+          if ! echo "$out" | grep -qF "$expected"; then
+            echo "::error::the example did not produce the documented verdicts"
+            echo "::error::expected: $expected"
+            exit 1
+          fi
+          # And the two `look`s are the two DIFFERENT reasons, not the same one twice.
+          echo "$out" | grep -q "must match exactly once" \
+            || { echo "::error::the anchor look is missing"; exit 1; }
+          echo "$out" | grep -q "no evidence it ran against the break" \
+            || { echo "::error::the did-not-run look is missing — the didrun edge is not working"; exit 1; }
+
+      - name: the tree came back
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::running canfail on its own example left the tree dirty"
+            git status --porcelain
+            exit 1
+          fi
+
+  cli:
+    # The shipped entry point, from the built wheel rather than the source tree.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: install the built artifact, not the source tree
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet build
+          python3 -m build --wheel --outdir /tmp/dist
+          # A venv, and the script by absolute path: installing into the runner's
+          # interpreter puts the console script wherever that scheme says, which is not
+          # always on PATH — and `command not found` there reads as a broken entry point
+          # when the entry point is fine.
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install /tmp/dist/*.whl
+          echo "venv scripts:"; ls -1 /tmp/venv/bin
+          if [ ! -x /tmp/venv/bin/canfail ]; then
+            echo '::error::the wheel installed but produced no canfail script'
+            exit 1
+          fi
+          cd /tmp
+          /tmp/venv/bin/canfail --help
+          /tmp/venv/bin/python -c "import canfail; print('wheel imports', canfail.__version__)"
