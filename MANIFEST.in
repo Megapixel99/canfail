@@ -1,0 +1,28 @@
+# What must NOT reach the Python distributions: the sdist's version of .npmignore.
+#
+# `packages` in pyproject.toml decides the WHEEL, and it is an allowlist: only the package
+# directory is installed, whatever this file says. The SDIST is the loose one. Its default
+# is "the package, plus whatever setuptools recognises", and what that sweeps up depends on
+# where a directory happens to sit: a `tests/` beside the package is picked up and a
+# `python/tests/` is not, so three repositories in this network shipped their suites and
+# six did not, for no reason anybody chose.
+#
+# This file is that choice, written down. It matches `assay-checks`, which reached it first.
+#
+# Checked rather than trusted: `python3 -m build --sdist` then `tar -tzf` is one command,
+# and the release workflow installs the built artifact into a clean environment before
+# anything is published.
+
+# --- shipped on purpose ------------------------------------------------------ #
+include LICENSE
+
+# --- tests and development, none of which an installed package needs --------- #
+prune tests
+prune example
+prune .github
+exclude .gitignore
+
+# --- build droppings --------------------------------------------------------- #
+global-exclude __pycache__/*
+global-exclude *.py[cod]
+global-exclude .DS_Store
