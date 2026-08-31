@@ -8,7 +8,7 @@ Break the thing on purpose, and check that your check notices.
 
 **A CI guard that has never failed may be incapable of failing.** A lint rule disabled by
 a config merge, a type check whose glob stopped matching, a schema validation step
-pointed at the wrong directory, a security scanner with an empty ruleset — every one of
+pointed at the wrong directory, a security scanner with an empty ruleset; every one of
 them is green forever, and green is what you were looking for.
 
 ```sh
@@ -60,15 +60,15 @@ code, because exit 1 alone would be satisfied by finding the wrong thing.
 
 `run` is a command (a list, or a string for a shell). `expect` is optional and is the
 third question below. `timeout` is per check and defaults to 900s; a check that hits it
-is `look`, never `catches` — see rule 2.
+is `look`, never `catches`: see rule 2.
 
 Paths in `file`, and in `evidence: { "wrote": ... }`, are relative to `--cwd` when you
 pass one, which is the directory the checks themselves run in.
 
 ## Four ways to get this wrong, all borrowed
 
-This is a mutation harness — a very small one, for CI configuration rather than for
-code — so it inherits the four properties that make one trustworthy.
+This is a mutation harness: a very small one, for CI configuration rather than for
+code, so it inherits the four properties that make one trustworthy.
 
 **1. The check must pass on the clean tree first.** A check that is already red tells you
 nothing when you break something: it was red before and it is red now. Every break under
@@ -76,7 +76,7 @@ such a check is a `look`, with the failing line quoted.
 
 **2. A failure is not a catch.** The check has to fail *for the reason you named*. A break
 that makes the file unparseable makes every check fail, and that reads as "caught" when
-nothing was caught — so a failure whose output looks like a syntax error is scored
+nothing was caught, so a failure whose output looks like a syntax error is scored
 `wrong-failure`, as is one that does not match your `expect`. **Nor is a kill.** A check
 that hit its `timeout` exits 124, which reads exactly like a check that went red; it did
 not go red, it did not finish, and it is scored `look`.
@@ -87,18 +87,18 @@ edited, which may not be the one you meant, so the check was asked about code no
 thinking of. Both are `look`, and the message says which.
 
 **4. The file must come back, and the restore must be checked.** This deliberately breaks
-source on disk. `finally` does not run on SIGTERM — a test spawns a real child, kills it,
-and asserts the source is back — and a restore that *ran* is not a restore that *worked*,
+source on disk. `finally` does not run on SIGTERM: a test spawns a real child, kills it,
+and asserts the source is back, and a restore that *ran* is not a restore that *worked*,
 so the digest is compared afterwards. That is [`restore-verified`](https://pypi.org/project/restore-verified/),
 which this package **depends on** rather than copies. It used to be 78 lines of `_Guard`
-inline — a quarter of the module — carried so `canfail` had no dependencies at all. That
+inline (a quarter of the module) carried so `canfail` had no dependencies at all. That
 was right while `restore-verified` was unpublished and wrong afterwards: those properties
 are exactly what that package is tested hardest on, and a second copy is a second thing to
 get wrong. `restore_mtime=False` is passed deliberately; see the bytecode note below.
 
 ## `evidence`: telling a blind guard from an absent one
 
-`blind` means two different things unless you say otherwise — *"the check ran and did not
+`blind` means two different things unless you say otherwise: *"the check ran and did not
 notice"* and *"the check never ran at all"*. The first says your guard is weak; the
 second says it is missing, and they send you to opposite ends of the CI file.
 
@@ -121,7 +121,7 @@ look  a break that only breaks the syntax — the check produced no evidence it 
 ```
 
 That is also the strong form of rule 2 above. Grepping the output for the word "syntax"
-*guesses* at what happened; an evidence predicate **measures** it — a check that never
+*guesses* at what happened; an evidence predicate **measures** it: a check that never
 reached its own tally did not run, whatever it printed on the way out, and in a language
 whose parse error uses words the regex has never heard of.
 
@@ -158,12 +158,12 @@ previous break's reason and the blind guard looked fine.
 The first fix was to stop restoring mtime. **Mutation testing showed that fix does
 nothing.** Re-enabling bytecode caching breaks the ordering test whether or not mtime is
 restored, because **mtime invalidation has one-second granularity** and this tool edits,
-runs and restores in milliseconds — a `.pyc` written from the broken source looks fresh
+runs and restores in milliseconds: a `.pyc` written from the broken source looks fresh
 either way. `PYTHONDONTWRITEBYTECODE` is the load-bearing guard; not restoring mtime is a
 cheap belt beside it.
 
-The general form is worth carrying: **anything keyed on mtime — bytecode caches, make,
-ninja, file watchers — is blind on a sub-second edit cycle.** Note the tension with
+The general form is worth carrying: **anything keyed on mtime (bytecode caches, make,
+ninja, file watchers) is blind on a sub-second edit cycle.** Note the tension with
 `restore-verified`, which restores mtime *on purpose* so a guarded edit does not trigger
 a rebuild. Both are right for their own job, and neither is right for both.
 
@@ -180,14 +180,14 @@ answer.
   configuration, anything where the thing being guarded is not a function.
 - **For Python code guarded by a Python test suite, prefer
   [`mutation-testing`](https://pypi.org/project/mutation-testing/).** It runs the same
-  loop — declare a mutation, apply it, see whether the suite notices — and it applies
+  loop (declare a mutation, apply it, see whether the suite notices) and it applies
   mutations by swapping the function's `__code__` object, so **source files are never
   modified**. That is a strictly safer design than this one for that case: no restore,
   no signal handling, no digest to verify, because nothing on disk was ever touched.
   Everything in "the file must come back" above is apparatus this package needs *only
   because* it edits real files, which is what buys it YAML, Terraform, Dockerfiles and
   anything else with no `__code__` object to swap. Read that trade before choosing.
-- String anchors, not AST matching. Deliberate — the files a CI guard protects are often
+- String anchors, not AST matching. Deliberate: the files a CI guard protects are often
   YAML, JSON, Terraform or Dockerfiles, where there is no parser to match against. The
   exactly-once rule is what makes a string anchor safe enough to use.
 - One break at a time, restored between each. No parallelism.
@@ -201,13 +201,13 @@ answer.
 python3 -m unittest discover -s tests
 ```
 
-28 tests. Five mutations were applied to the original five properties — skipping the
+28 tests. Five mutations were applied to the original five properties: skipping the
 clean-tree baseline, accepting any anchor count, scoring a syntax failure as a catch, not
-verifying the restore, and re-enabling bytecode caching — and each was caught by the test
+verifying the restore, and re-enabling bytecode caching, and each was caught by the test
 that should catch it. A sixth (restoring mtime) **survived**, which is how the paragraph
 above got corrected. Six more were applied to the fixes below and all six were caught.
 
-The SIGTERM test — a real child, really killed, the source checked by digest afterwards —
+The SIGTERM test (a real child, really killed, the source checked by digest afterwards)
 now lives in [`restore-verified`](https://pypi.org/project/restore-verified/), which owns
 that property. What stays here is the integration assertion: canfail's own use of the
 guard leaves the tree as it found it.
@@ -218,8 +218,8 @@ Each of these was a way `canfail` reported a verdict it had not earned, which is
 defect it exists to find in other people's CI. Each is now pinned by a test that fails
 without the fix.
 
-- **A killed check was scored `catches`.** `didrun` does not raise on a timeout — it
-  kills the child and reports exit 124 — and 124 is non-zero, so a check that *hung* on
+- **A killed check was scored `catches`.** `didrun` does not raise on a timeout; it
+  kills the child and reports exit 124, and 124 is non-zero, so a check that *hung* on
   the broken source read as a check that *noticed* it. Worse, the two paths disagreed:
   without `evidence` the same hang was a `look`. One timeout is one verdict, and it is
   `look`.
