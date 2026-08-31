@@ -13,4 +13,4 @@ from .core import (
 )
 
 __all__ = ["run_config", "run_check", "load_config", "Report", "Outcome", "RestoreFailed"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
