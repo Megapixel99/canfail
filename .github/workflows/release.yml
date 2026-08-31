@@ -52,6 +52,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: install, because importing canfail now imports its dependencies
+        run: python3 -m pip install --quiet .
+
       - id: read
         name: Do the two versions agree, and is anything unpublished?
         run: |
@@ -67,7 +70,7 @@ jobs:
           # the number that drifts. PYTHONDONTWRITEBYTECODE so this check leaves no
           # `.pyc` for a later run to read -- cache invalidation is keyed on mtime at
           # one-second granularity, which this package documents at length.
-          dunder=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 -c \
+          dunder=$(PYTHONDONTWRITEBYTECODE=1 python3 -c \
             "import canfail; print(canfail.__version__)")
           if [ "$version" != "$dunder" ]; then
             echo "::error::pyproject.toml says $version and __version__ says $dunder"
