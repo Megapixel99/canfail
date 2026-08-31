@@ -232,11 +232,17 @@ def _one_break(check_name: str, br: dict, check: dict, cwd, timeout,
     anchor = br["replace"]
     hits = original.count(anchor)
     if hits != 1:
+        # Built before the f-string rather than inside it: a multi-line expression
+        # inside an f-string is 3.12 syntax, and `requires-python` here says 3.9. The
+        # matrix caught it, which is what a matrix that starts at the declared floor is
+        # for -- a floor nothing runs at is a claim, not a constraint.
+        consequence = ("nothing would have been broken" if hits == 0 else
+                       "the first occurrence would be edited, which may not be the one "
+                       "you meant")
         return Outcome(
             check_name, br_name, "look",
             f"the anchor matches {hits} times in {br['file']} and must match exactly "
-            f"once — {'nothing would have been broken' if hits == 0 else 'the first '
-            'occurrence would be edited, which may not be the one you meant'}")
+            f"once — {consequence}")
 
     try:
         with guarded(path, restore_mtime=False) as guard:
