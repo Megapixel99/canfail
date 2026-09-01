@@ -1,6 +1,6 @@
 # A tool that finds guards which cannot fail has to answer for its own.
 #
-# Three gates here are this package's own properties pointed back at the package:
+# Four gates here are this package's own properties pointed back at the package:
 #
 #   1. IT RUNS ON ITS OWN EXAMPLE, and the verdicts are asserted exactly. `canfail`'s
 #      whole claim is that it can tell a guard that catches from one that is blind from
@@ -15,6 +15,13 @@
 #   3. IT DECLARES DEPENDENCIES, AND THEY ARE THE DECLARED ONES. Unlike the roots this
 #      builds on, `canfail` is not dependency-free -- it is layer 1. The check is not
 #      "none" but "these, and nothing that arrived by accident".
+#
+#   4. THE SUITE HAS A DENOMINATOR. A suite that SHRANK exits 0 on every Python in this
+#      matrix -- rename one file, mis-place one directory, and 28 tests quietly become
+#      three under a green tick. That is this package's own thesis pointed at its own CI,
+#      and it would be absurd to ship the argument and not take it. The two JavaScript
+#      halves of this network answer it: `didrun` reads the count back out of the run and
+#      puts a floor under it, and `zerocase` puts one under the report.
 #
 # Action versions are pinned at v7 deliberately. Older majors still run, on a Node the
 # runner silently substitutes, and a pin that is wrong for its own runtime is invisible
@@ -51,6 +58,27 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v7
+        with:
+          # `didrun` declares `engines: node >=20`. Pinning the LTS rather than taking
+          # the runner's default, which moves without this file changing.
+          node-version: '22'
+
+      - name: the tools that will hold the suite to a count
+        # GLOBALLY, on purpose: an `npm install` in the working directory writes
+        # `node_modules/` and a lockfile into a tree that "the tree came back" checks
+        # for cleanliness two steps from here, and neither is in `.gitignore`.
+        #
+        # Both, and not just `zerocase`: it depends on `@megapixel99/didrun` and so gets
+        # the library either way, but a global install links only the top-level
+        # package's bin -- the `didrun` command itself arrives only when it is asked for
+        # by name.
+        run: |
+          set -euo pipefail
+          npm install -g 'zerocase@^0.1.5'
+          npm install -g '@megapixel99/didrun@^0.1.3'
+          zerocase --help > /dev/null && didrun --help > /dev/null
+          echo "zerocase $(npm view zerocase version)  didrun $(npm view @megapixel99/didrun version)"
 
       - name: install the declared dependencies, and only those
         # LAYER 1, so "no dependencies" is the wrong assertion. `restore-verified` guards
@@ -72,8 +100,16 @@ jobs:
           assert names == {"restore-verified", "didrun"}, names
           PY
 
-      - name: the suites
-        run: python3 -m unittest discover -s tests -v
+      - name: the suites, and the count they came back with
+        # EXIT 0 IS NOT THE EVIDENCE, and the dangerous case is not the empty one.
+        # Discovering NOTHING at least exits 5 from 3.12 on; discovering FEWER exits 0 on
+        # every version in this matrix, so a renamed file taking twenty tests with it is
+        # a green tick and nothing else. The floor is 25 against the 28 that run -- a
+        # floor rather than a headcount, so adding a test does not edit this file, while
+        # a suite that quietly collapsed toward zero cannot report clean.
+        run: |
+          didrun --expect-count 'Ran ([0-9]+) tests?' --min 25 \
+            -- python3 -m unittest discover -s tests -v
 
       - name: the tree came back
         # This package breaks files on purpose. A dirty tree here means a restore was
@@ -117,8 +153,15 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
       - name: install
-        run: python3 -m pip install --quiet .
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet .
+          npm install -g 'zerocase@^0.1.5'
+          npm install -g '@megapixel99/didrun@^0.1.3'
 
       - name: it finds the blind guard in its own example
         # `example/` holds four declared breaks and one of each outcome on purpose: one
@@ -149,6 +192,40 @@ jobs:
           echo "$out" | grep -q "no evidence it ran against the break" \
             || { echo "::error::the did-not-run look is missing — the didrun edge is not working"; exit 1; }
 
+      - name: the denominator, read out of the report rather than the prose
+        # The step above greps English; this one reads the number. `--json` writes the
+        # machine-readable report and `zerocase` gates it two ways: `breaks` must come
+        # back at four or more, AND the file must have been written BY THIS RUN -- a
+        # stale artefact left by an earlier step reads exactly like a fresh pass, which
+        # is the whole reason `zerocase read` is not what is used here.
+        #
+        # The report goes to /tmp because this job checks its own tree for cleanliness
+        # in the step below.
+        #
+        # NOTHING HERE MAY GROW A `-h` OR `--help`. zerocase 0.1.5 still tests for those
+        # across the whole argv, before it splits on `--`, so either one anywhere in this
+        # line -- including inside the `sh -c` string as its own word -- makes zerocase
+        # print its usage and return 0 without running canfail at all. `--json` is safe;
+        # those two are not. (didrun fixed the same bug in 0.1.3; zerocase has not.)
+        #
+        # canfail exits 1 HERE BY DESIGN: `example/` contains findings on purpose, and
+        # zerocase passes a command's own status through. So 1 is the pass -- and
+        # anything else is not, which is why this compares against 1 rather than merely
+        # asking for non-zero: zerocase's own 3 (nothing ran, or the floor was not met)
+        # and canfail's own 2 (the tool could not run) are both non-zero, and both mean
+        # this step proved nothing.
+        run: |
+          set +e
+          zerocase --json /tmp/canfail-report.json:breaks --min 4 \
+            -- sh -c 'python3 -m canfail.cli example/canfail.json --json > /tmp/canfail-report.json'
+          code=$?
+          set -e
+          echo "exit=$code"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 (findings, over a denominator of 4), got $code"
+            exit 1
+          fi
+
       - name: the tree came back
         run: |
           if [ -n "$(git status --porcelain)" ]; then
@@ -165,6 +242,16 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: didrun only, because this job produces no report for zerocase to read
+        # THE FLOOR IS LOAD-BEARING. Below 0.1.3, didrun tested `argv.includes("--help")`
+        # across the whole argv rather than only its own half, so `-- canfail --help`
+        # printed didrun's usage and returned 0 without ever spawning the command: the
+        # check below would have passed unconditionally. Pinned rather than trusted,
+        # because a check that silently stops checking is what this repository is about.
+        run: npm install -g '@megapixel99/didrun@^0.1.3'
       - name: install the built artifact, not the source tree
         run: |
           set -euo pipefail
@@ -182,5 +269,13 @@ jobs:
             exit 1
           fi
           cd /tmp
-          /tmp/venv/bin/canfail --help
+          # `--help` EXITING 0 IS NOT THE EVIDENCE THAT IT PRINTED ANYTHING. An entry
+          # point that imports, reaches argparse and writes nothing to either stream
+          # still exits 0, and that reads here as a working CLI.
+          #
+          # Two expectations, and they are ANDed: the usage line proves argparse ran and
+          # the shipped script knows its own name, and `--json` proves the flag the
+          # `itself` job depends on survived into the wheel.
+          didrun --expect 'usage: canfail' --expect '\-\-json' \
+            -- /tmp/venv/bin/canfail --help
           /tmp/venv/bin/python -c "import canfail; print('wheel imports', canfail.__version__)"
